@@ -9,8 +9,9 @@ import android.view.Gravity
 import android.view.View
 import android.widget.*
 import rikka.shizuku.Shizuku
-import java.io.BufferedReader
-import java.io.InputStreamReader
+import android.content.ComponentName
+import android.content.ServiceConnection
+import android.os.IBinder
 import java.util.concurrent.Executors
 
 class MainActivity : Activity() {
@@ -18,6 +19,21 @@ class MainActivity : Activity() {
     private lateinit var output: TextView
     private val executor = Executors.newSingleThreadExecutor()
     private val requestCode = 4201
+    @Volatile private var remoteService: IUserService? = null
+    @Volatile private var binding = false
+
+    private val serviceConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            remoteService = IUserService.Stub.asInterface(service)
+            binding = false
+            runOnUiThread { status.text = "Shizuku conectado • serviço pronto" }
+        }
+        override fun onServiceDisconnected(name: ComponentName?) {
+            remoteService = null
+            binding = false
+            runOnUiThread { status.text = "Serviço Shizuku desconectado" }
+        }
+    }
 
     private val permissionListener = Shizuku.OnRequestPermissionResultListener { code, result ->
         if (code == requestCode) {
@@ -140,20 +156,50 @@ class MainActivity : Activity() {
     private fun runShell(command: String) {
         if (!Shizuku.pingBinder() ||
             Shizuku.checkSelfPermission() != android.content.pm.PackageManager.PERMISSION_GRANTED) {
-            appendOutput("Ação bloqueada: autorize o Shizuku primeiro.")
+            appendOutput("Ação bloqueada: inicie o Shizuku e autorize o Performance Booster.")
             return
         }
+
+        val current = remoteService
+        if (current != null) {
+            executeRemote(current, command)
+            return
+        }
+        if (binding) {
+            appendOutput("O serviço Shizuku está conectando. Tente novamente em alguns segundos.")
+            return
+        }
+
+        try {
+            binding = true
+            val args = Shizuku.UserServiceArgs(
+                ComponentName(packageName, ShellUserService::class.java.name)
+            ).daemon(false)
+                .processNameSuffix("performance_booster")
+                .debuggable(BuildConfig.DEBUG)
+                .version(1)
+            Shizuku.bindUserService(args, serviceConnection)
+            appendOutput("Solicitando conexão ao serviço Shizuku…")
+        } catch (e: Exception) {
+            binding = false
+            appendOutput("Não foi possível iniciar UserService: ${e.message}")
+        }
+    }
+
+    private fun executeRemote(service: IUserService, command: String) {
         status.text = "Executando comando…"
         executor.execute {
             try {
-                val process = Shizuku.newProcess(arrayOf("sh", "-c", command), null, null)
-                val stdout = BufferedReader(InputStreamReader(process.inputStream)).readText()
-                val stderr = BufferedReader(InputStreamReader(process.errorStream)).readText()
-                val code = process.waitFor()
-                val result = "Exit: $code\n$stdout\n$stderr".trim()
-                runOnUiThread { status.text = "Comando concluído"; appendOutput(result) }
+                val result = service.exec(command)
+                runOnUiThread {
+                    status.text = "Comando concluído"
+                    appendOutput(result)
+                }
             } catch (e: Exception) {
-                runOnUiThread { status.text = "Falha ao executar"; appendOutput(e.message ?: "Erro desconhecido") }
+                runOnUiThread {
+                    status.text = "Falha ao executar"
+                    appendOutput(e.message ?: "Erro desconhecido")
+                }
             }
         }
     }
@@ -164,6 +210,15 @@ class MainActivity : Activity() {
 
     override fun onDestroy() {
         Shizuku.removeRequestPermissionResultListener(permissionListener)
+        try {
+            val args = Shizuku.UserServiceArgs(
+                ComponentName(packageName, ShellUserService::class.java.name)
+            ).daemon(false)
+                .processNameSuffix("performance_booster")
+                .debuggable(BuildConfig.DEBUG)
+                .version(1)
+            Shizuku.unbindUserService(args, serviceConnection, true)
+        } catch (_: Exception) { }
         executor.shutdown()
         super.onDestroy()
     }
